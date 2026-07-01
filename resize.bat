@@ -73,13 +73,85 @@ if defined targetFormat (
     )
 )
 
+echo.
+echo %ACCENT%Select video codec:%RESET%
+echo %ACCENT%1. H.264 (libx264)   - universal compatibility%RESET%
+echo %ACCENT%2. H.265 (libx265)   - smaller files, HEVC%RESET%
+echo %ACCENT%3. VP9   (libvpx-vp9)- web, needs webm/mkv%RESET%
+echo %ACCENT%4. AV1   (libsvtav1) - smallest, very slow encode%RESET%
+choice /c 1234 /n /m "%ACCENT%Choose codec [1/2/3/4]: %RESET%"
+if errorlevel 4 (
+    set "codec=av1"
+) else if errorlevel 3 (
+    set "codec=vp9"
+) else if errorlevel 2 (
+    set "codec=h265"
+) else (
+    set "codec=h264"
+)
+
+echo.
+echo %ACCENT%Select quality:%RESET%
+echo %ACCENT%1. High quality  (larger files)%RESET%
+echo %ACCENT%2. Balanced      (recommended)%RESET%
+echo %ACCENT%3. Smaller size%RESET%
+choice /c 123 /n /m "%ACCENT%Choose quality [1/2/3]: %RESET%"
+if errorlevel 3 (
+    set "qlevel=3"
+) else if errorlevel 2 (
+    set "qlevel=2"
+) else (
+    set "qlevel=1"
+)
+
+rem The AV1 encoder depends on the FFmpeg build: prefer SVT-AV1, else libaom.
+set "av1Enc=-c:v libaom-av1 -b:v 0 -cpu-used 6 -row-mt 1"
+ffmpeg -hide_banner -encoders 2>nul | findstr /i "libsvtav1" >nul
+if not errorlevel 1 set "av1Enc=-c:v libsvtav1 -preset 8"
+
+rem Per-codec encoder flags, CRF-per-quality, and allowed containers.
+rem CRF scales differ per codec, so each maps the quality level to its own value.
+if /i "!codec!"=="h264" (
+    set "vEnc=-c:v libx264 -preset fast"
+    set "defContainer=mp4"
+    set "allowed= mp4 mov mkv avi "
+    if "!qlevel!"=="1" set "crf=20"
+    if "!qlevel!"=="2" set "crf=23"
+    if "!qlevel!"=="3" set "crf=28"
+) else if /i "!codec!"=="h265" (
+    set "vEnc=-c:v libx265 -preset fast"
+    set "defContainer=mp4"
+    set "allowed= mp4 mov mkv "
+    if "!qlevel!"=="1" set "crf=24"
+    if "!qlevel!"=="2" set "crf=28"
+    if "!qlevel!"=="3" set "crf=32"
+) else if /i "!codec!"=="vp9" (
+    set "vEnc=-c:v libvpx-vp9 -b:v 0 -deadline good -cpu-used 2 -row-mt 1"
+    set "defContainer=webm"
+    set "allowed= webm mkv "
+    if "!qlevel!"=="1" set "crf=31"
+    if "!qlevel!"=="2" set "crf=33"
+    if "!qlevel!"=="3" set "crf=36"
+) else (
+    set "vEnc=!av1Enc!"
+    set "defContainer=mkv"
+    set "allowed= mkv mp4 webm "
+    if "!qlevel!"=="1" set "crf=25"
+    if "!qlevel!"=="2" set "crf=30"
+    if "!qlevel!"=="3" set "crf=35"
+)
+
+echo.
+echo %DIM%Using codec !codec! at CRF !crf!.%RESET%
+
 if /i "!mode!"=="width" (
     set "scaleFilter=scale=!dimension!:-2"
 ) else (
     set "scaleFilter=scale=-2:!dimension!"
 )
 
-set "outputDir=!mode!_!dimension!"
+if not exist "exports" mkdir "exports"
+set "outputDir=exports\!mode!_!dimension!_!codec!_crf!crf!"
 if not exist "!outputDir!" mkdir "!outputDir!"
 
 set /a count=0
@@ -87,13 +159,38 @@ for %%f in (*.mp4 *.mov *.mkv *.avi *.wmv *.flv *.webm *.m4v *.mpg *.mpeg *.ts) 
     if exist "%%f" (
         set /a count+=1
         set "filename=%%~nf"
+
+        rem Decide the output extension: chosen format, else the original.
         if defined targetFormat (
-            set "outExt=.!targetFormat!"
+            set "ext=!targetFormat!"
         ) else (
-            set "outExt=%%~xf"
+            set "ext=%%~xf"
+            set "ext=!ext:~1!"
         )
-        echo %DIM%Processing "%%f"...%RESET%
-        ffmpeg -i "%%f" -c:v libx264 -preset fast -crf 28 -bufsize 2M -c:a aac -b:a 128k -movflags +faststart -vf "!scaleFilter!" "!outputDir!\!filename!!outExt!"
+
+        rem Force a container the chosen codec can actually write.
+        echo !allowed!| findstr /i /c:" !ext! " >nul
+        if errorlevel 1 (
+            echo %ACCENT%  Note: .!ext! is not compatible with !codec!; using .!defContainer! instead.%RESET%
+            set "ext=!defContainer!"
+        )
+
+        rem WebM needs Opus audio; every other container uses AAC.
+        if /i "!ext!"=="webm" (
+            set "aEnc=-c:a libopus -b:a 128k"
+        ) else (
+            set "aEnc=-c:a aac -b:a 128k"
+        )
+
+        rem Faststart only matters for MP4/MOV; add Apple HEVC tag for H.265 there.
+        set "extra="
+        if /i "!ext!"=="mp4" set "extra=-movflags +faststart"
+        if /i "!ext!"=="mov" set "extra=-movflags +faststart"
+        if /i "!codec!"=="h265" if /i "!ext!"=="mp4" set "extra=!extra! -tag:v hvc1"
+        if /i "!codec!"=="h265" if /i "!ext!"=="mov" set "extra=!extra! -tag:v hvc1"
+
+        echo %DIM%Processing "%%f" -^> !filename!.!ext!...%RESET%
+        ffmpeg -i "%%f" !vEnc! -crf !crf! !extra! -vf "!scaleFilter!" !aEnc! "!outputDir!\!filename!.!ext!"
         if errorlevel 1 (
             echo %ERR%  [FAILED] %%f%RESET%
         ) else (
